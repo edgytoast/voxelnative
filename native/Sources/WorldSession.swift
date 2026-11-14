@@ -158,7 +158,8 @@ final class WorldSession {
     // option per tick while the menu was open, rebuilding the array each time.
     private let koganeOptions: [String] = {
         // No "Take photo": the left Create button (and P / F12) does that. No Chat:
-        // the app doesn't send or show chat.
+        // the app doesn't show other players' chat (App Store user generated
+        // content rules), only its own command replies.
         var o = ["Resume", "Coordinates", "Biome", "Minimap", "Exit to menu", "Quit game"]
         if UserDefaults.standard.bool(forKey: "vrdev.testingMode") { o.insert("Bug note", at: 1) }
         return o
@@ -493,6 +494,7 @@ final class WorldSession {
     // is fixed for the frame, so one read feeds every HUD/nametag helper.
     private var frameHeadXform = matrix_identity_float4x4
     private var hudK: Float = 1                     // ViewSettings.hudDistance, read once per tick
+    private var hudS: Float = 1                     // ViewSettings.hudSpread, read once per tick
     private struct ActiveSpawner { let spec: Client.ParticleSpawner; var emitted: Int; var age: Float; var gone: Float; var spawnRemainder: Float = 0 }
     private var activeSpawners: [Int: ActiveSpawner] = [:]
     private var digElapsed: Float = 0
@@ -6299,15 +6301,21 @@ final class WorldSession {
     // Server HUD elements: generic image/text/waypoint elements from
     // HUDADD (boss bars, potion effects, vignettes), drawn in the overlay
     // against a nominal 1920x1080 screen mapped onto a 16:9 window
-    // (+-0.36 x +-0.2025 rad) 1.2 m ahead. Statbars and the XP pair have their own paths.
+    // (+-0.36 x +-0.2025 rad, times the HUD spread setting) 1.2 m ahead.
+    // Statbars and the XP pair have their own paths.
     private var hudTextLayers: [Int: (layer: Int, text: String, aspect: Float)] = [:]
     private var hudTextBlocks: [Int: (layers: [Int], text: String, aspect: Float, lines: Int, lineToCap: Float)] = [:]
     private var hudElementsLogged = false          // sim: one-shot dump of the server's HUD elements
-    private static let hudScreen = SIMD2<Float>(1920, 1080)
+    private static let hudScreenBase = SIMD2<Float>(1920, 1080)
     // Same angle per nominal pixel on both axes (16:9, like the screen), so a
     // square texture draws square and text keeps its glyph shape. A taller
     // window used to stretch every server image and glyph 1.58x vertically.
-    private static let hudHalfAngle = SIMD2<Float>(0.36, 0.2025)
+    private static let hudHalfAngleBase = SIMD2<Float>(0.36, 0.2025)
+    // The HUD spread setting grows the window and the nominal screen together,
+    // so the angle per pixel (and with it every size) stays put while the
+    // corner-anchored elements move out toward the edge of view.
+    private var hudScreen: SIMD2<Float> { Self.hudScreenBase * hudS }
+    private var hudHalfAngle: SIMD2<Float> { Self.hudHalfAngleBase * hudS }
     private static let hudDepth: Float = 1.2
     /// Desktop HUD sizes are tuned for a monitor, where 20 px of text is fine;
     /// at the same angular size in VR it's unreadable. Sizes (not positions)
@@ -6692,9 +6700,8 @@ final class WorldSession {
         // as an image element; ours is wrist-anchored, so a strip of
         // empty slots floating at the bottom of view is just noise.
         if e.type == 0, e.text.range(of: "hotbar", options: .caseInsensitive) != nil { return true }
-        // mcl_offhand's slot frame and item: drawn head-locked above the
-        // hearts instead (appendOffhandHUD), so it moves with the view like
-        // the vitals and doesn't sit on top of the heart row.
+        // mcl_offhand's slot frame and item: the offhand item is held in the
+        // left hand instead, so the slot would only sit on top of the heart row.
         if e.type == 0, e.text.hasPrefix("mcl_offhand_slot") { return true }
         if e.type == 3, e.text == "offhand" { return true }
         // The spyglass's black scope mask: we zoom with our own lens disc
@@ -6873,12 +6880,12 @@ final class WorldSession {
         let hu = simd_normalize(SIMD3<Float>(hx.columns.1.x, hx.columns.1.y, hx.columns.1.z))
         let hf = -simd_normalize(SIMD3<Float>(hx.columns.2.x, hx.columns.2.y, hx.columns.2.z))
         let D = Self.hudDepth * hudK
-        let kx = 2 * Self.hudHalfAngle.x / Self.hudScreen.x, ky = 2 * Self.hudHalfAngle.y / Self.hudScreen.y
+        let kx = 2 * hudHalfAngle.x / hudScreen.x, ky = 2 * hudHalfAngle.y / hudScreen.y
         let radiusPx = Self.minimapRadiusPx
         // The top lines up with mcl_potions' effect icons (offset y=3).
         let top = 3 * Self.hudSizeBoost
-        let cpx = SIMD2<Float>(Self.hudScreen.x - 40 - radiusPx, top + radiusPx)
-        let az = (cpx.x - Self.hudScreen.x / 2) * kx, el = (Self.hudScreen.y / 2 - cpx.y) * ky
+        let cpx = SIMD2<Float>(hudScreen.x - 40 - radiusPx, top + radiusPx)
+        let az = (cpx.x - hudScreen.x / 2) * kx, el = (hudScreen.y / 2 - cpx.y) * ky
         let centre = headPos + hf * D + hr * (tan(az) * D) + hu * (tan(el) * D)
         let hs = tan(radiusPx * kx) * D
         // Heading clockwise from north (+Z north, +X east). The map turns the
@@ -6919,6 +6926,7 @@ final class WorldSession {
             // instead of string-matching all ~80 of them every tick.
             sortedHud = client.hudElements.filter { !Self.hudAlwaysSkipped($0.value) }
                 .map { ($0.key, $0.value) }.sorted { $0.1.zIndex < $1.1.zIndex }
+            sortedHud = Self.coordinateColumns(sortedHud)   // once per HUD change, not per tick
             sortedHudGen = client.hudGeneration
             // Server HUD ids are a per-player counter, never reused, so a
             // removed element (boss bar name, title, award toast) kept its
@@ -6939,9 +6947,10 @@ final class WorldSession {
         var elems = sortedHud
         #if targetEnvironment(simulator)
         let hudBaseCount = elems.count
-        if UserDefaults.standard.bool(forKey: "vrdev.fakeHud") { elems.append(contentsOf: Self.fakeHudElements()) }
+        if UserDefaults.standard.bool(forKey: "vrdev.fakeHud") {
+            elems.append(contentsOf: Self.fakeHudElements()); elems = Self.coordinateColumns(elems)
+        }
         #endif
-        elems = Self.coordinateColumns(elems)
         // A latched sneak / sprint (a tap on the left stick click / left grip)
         // gets a small tag bottom-left by the hearts, since nothing else shows
         // the toggle is on; a hold gets none (you can feel it). (A crouching /
@@ -6991,11 +7000,11 @@ final class WorldSession {
         let hu = simd_normalize(SIMD3<Float>(hx.columns.1.x, hx.columns.1.y, hx.columns.1.z))
         let hf = -simd_normalize(SIMD3<Float>(hx.columns.2.x, hx.columns.2.y, hx.columns.2.z))
         let D = Self.hudDepth * hudK        // the HUD distance setting
-        let kx = 2 * Self.hudHalfAngle.x / Self.hudScreen.x     // rad per nominal pixel
-        let ky = 2 * Self.hudHalfAngle.y / Self.hudScreen.y
+        let kx = 2 * hudHalfAngle.x / hudScreen.x     // rad per nominal pixel
+        let ky = 2 * hudHalfAngle.y / hudScreen.y
         // Origin-space point for a nominal screen pixel (y down), on the window.
         func at(_ px: SIMD2<Float>) -> SIMD3<Float> {
-            let az = (px.x - Self.hudScreen.x / 2) * kx, el = (Self.hudScreen.y / 2 - px.y) * ky
+            let az = (px.x - hudScreen.x / 2) * kx, el = (hudScreen.y / 2 - px.y) * ky
             return headPos + hf * D + hr * (tan(az) * D) + hu * (tan(el) * D)
         }
         // Nominal screen pixel of a world (server-grid node) position, or nil
@@ -7007,8 +7016,8 @@ final class WorldSession {
             let op = SIMD3<Float>(rx * cy - rz * sy, ry, -(rx * sy + rz * cy)) - headPos
             let z = simd_dot(op, hf)
             guard z > 0.05 else { return nil }
-            return SIMD2(Self.hudScreen.x / 2 + atan2(simd_dot(op, hr), z) / kx,
-                         Self.hudScreen.y / 2 - atan2(simd_dot(op, hu), z) / ky)
+            return SIMD2(hudScreen.x / 2 + atan2(simd_dot(op, hr), z) / kx,
+                         hudScreen.y / 2 - atan2(simd_dot(op, hu), z) / ky)
         }
         // Budget counts quads actually emitted: VoxeLibre pre-creates ~80 empty
         // potion-effect slots, which must not starve the elements after them.
@@ -7048,7 +7057,7 @@ final class WorldSession {
             // Pixel offsets scale with the size boost so a mod's layout (a title
             // over its bar, a label over its timer) stays proportional; only the
             // normalised position stays pinned to the screen edge.
-            var anchor = e.pos * Self.hudScreen + e.offset * Self.hudSizeBoost
+            var anchor = e.pos * hudScreen + e.offset * Self.hudSizeBoost
             // The minimap takes the top-right corner; potion icons and their
             // timers (anchored there) hang below it instead. (Sliding them left
             // put the timers on the boss bar's right end.)
@@ -7113,12 +7122,12 @@ final class WorldSession {
                 let gp = gaugeParts(e.text)                      // XP / boss bar fill: two layers + a clip, not one per percent
                 guard let img = hudImage(gp?.base ?? e.text) else { continue }
                 var dst = img.src * e.scale * Self.hudSizeBoost
-                if e.scale.x < 0 { dst.x = Self.hudScreen.x * (-0.01 * e.scale.x) }   // percent of screen: no boost
-                if e.scale.y < 0 { dst.y = Self.hudScreen.y * (-0.01 * e.scale.y) }
+                if e.scale.x < 0 { dst.x = hudScreen.x * (-0.01 * e.scale.x) }   // percent of screen: no boost
+                if e.scale.y < 0 { dst.y = hudScreen.y * (-0.01 * e.scale.y) }
                 // The boost is for legibility, not for bars: mcl_bossbars' 546 px
                 // bar came out 1365 of the window's 1920 px, under the minimap
                 // and over the coordinate readout. Half the window is plenty.
-                let maxW = Self.hudScreen.x * 0.5
+                let maxW = hudScreen.x * 0.5
                 if e.scale.x > 0, dst.x > maxW { dst *= maxW / dst.x }
                 var base = anchor
                 if e.type == 5 { guard let p = pixel(ofNode: e.worldPos) else { continue }; base = p + e.offset * Self.hudSizeBoost }
@@ -7811,6 +7820,7 @@ final class WorldSession {
         // rolled with the head against the hearts next to them (Eric: weird).
         frameHeadXform = Renderer.levelCamera(player.headXform())
         hudK = ViewSettings.shared.hudDistance
+        hudS = ViewSettings.shared.hudSpread
         // Snapshot the entity list once per tick and reuse it for both the model-
         // texture registration and the draw loop below, instead of filtering
         // objects.values into a fresh array twice.
@@ -8237,7 +8247,7 @@ final class WorldSession {
         var ov: [Float] = []; var oi: [UInt32] = []
         ov.reserveCapacity(lastOverlayVerts); oi.reserveCapacity(lastOverlayIdx)
         if dead, deathTextLayer >= 0 {
-            appendDeathText(layer: deathTextLayer, gaze: aimDir, cosY: cy, sinY: sy, v: &ov, idx: &oi)
+            appendDeathText(layer: deathTextLayer, v: &ov, idx: &oi)
         }
         appendChat(v: &ov, idx: &oi)
         appendStatusBanner(v: &ov, idx: &oi)
@@ -8364,65 +8374,11 @@ final class WorldSession {
     /// counting health-boost and absorption rows. The hearts are 0.05 rad
     /// tall, so the bar at their own -0.28 cut across the icons.
     private func xpBarElev() -> Float {
-        var top: Float = -0.30
+        var top: Float = -0.30 * hudS
         var rest = hp - 20
-        while rest > 0 && top < -0.30 + 0.2 { top += 0.05; rest -= 20 }
+        while rest > 0 && top < -0.30 * hudS + 0.2 { top += 0.05; rest -= 20 }
         if client.absorption > 0 { top += 0.045 }
         return top + 0.045
-    }
-
-    /// Where the offhand item sits in the vitals band: on the XP level's row,
-    /// just right of the digits at az 0. Just above the hearts put it on top
-    /// of the XP bar (device shot-1790199793).
-    /// (az, elev) in radians, like the hearts.
-    private func offhandHudAngles() -> (az: Float, elev: Float) {
-        (0.09, xpBarElev() + 0.05)
-    }
-
-    /// The offhand item (mcl_offhand) as a head-locked icon from the node atlas,
-    /// fixed to the view like the hearts. Its count and wear bar need the model
-    /// texture set, so appendOffhandExtras draws those in the overlay.
-    private func appendOffhandHUD(origin: SIMD3<Float>, gaze: SIMD3<Float>,
-                                  into billboards: inout [EntityInstance]) {
-        guard let st = client.inventory["offhand"]?.first ?? nil, !st.name.isEmpty,
-              let tile = invTileCache[iconKey(st)] ?? nil, let layer = atlas.tileLayer(tile) else { return }
-        let hudDist: Float = 1.35 * hudK, size: Float = 0.05 * hudDist
-        let (az, elev) = offhandHudAngles()
-        let (fwd, right, up) = stableFrame(gaze, horizFwd: player.bodyForward())
-        let dir = simd_normalize(fwd + right * tan(az) + up * tan(elev))
-        billboards.append(EntityInstance(pos: origin + dir * hudDist - SIMD3(0, size * 0.5, 0),
-                                         width: size, height: size, layer: Float(layer), light: 255))
-    }
-
-    /// Stack count and wear bar for the offhand icon, in the overlay stream
-    /// (text and bars live in the model texture set), anchored to the same
-    /// head frame and angles as appendOffhandHUD.
-    private func appendOffhandExtras(v: inout [Float], idx: inout [UInt32]) {
-        guard let st = client.inventory["offhand"]?.first ?? nil, !st.name.isEmpty else { return }
-        let hx = frameHeadXform
-        let headPos = SIMD3<Float>(hx.columns.3.x, hx.columns.3.y, hx.columns.3.z)
-        let hr = simd_normalize(SIMD3<Float>(hx.columns.0.x, hx.columns.0.y, hx.columns.0.z))
-        let hu = simd_normalize(SIMD3<Float>(hx.columns.1.x, hx.columns.1.y, hx.columns.1.z))
-        let hf = -simd_normalize(SIMD3<Float>(hx.columns.2.x, hx.columns.2.y, hx.columns.2.z))
-        let hudDist: Float = 1.35 * hudK, size: Float = 0.05 * hudDist
-        let (az, elev) = offhandHudAngles()
-        let center = headPos + simd_normalize(hf + hr * tan(az) + hu * tan(elev)) * hudDist - hf * 0.002
-        if st.count > 1, let t = hudTextLayer(id: -2000, text: String(st.count)) {
-            let th = size * 0.45, tw = th * max(0.4, t.aspect)
-            appendQuad(center: center + hr * (size / 2 - tw / 2) - hu * (size / 2 - th / 2), right: hr, up: hu,
-                       hw: tw / 2, hh: th / 2, layer: t.layer, tint: 16777215, v: &v, idx: &idx)
-        }
-        if st.wear > 0, highlightLayer >= 0 {
-            let left = max(0, min(1, 1 - Float(st.wear) / 65535))
-            let bw = size * 0.8, bh = size * 0.08
-            let by = center - hu * (size / 2 - bh * 1.5)
-            appendQuad(center: by, right: hr, up: hu, hw: bw / 2, hh: bh / 2,
-                       layer: highlightLayer, tint: Self.packTint(0, 0, 0), v: &v, idx: &idx)
-            let fw = bw * left
-            appendQuad(center: by - hr * (bw / 2 - fw / 2) - hf * 0.001, right: hr, up: hu, hw: fw / 2, hh: bh / 2,
-                       layer: highlightLayer,
-                       tint: Self.packTint(Int(255 * min(1, 2 * (1 - left))), Int(255 * min(1, 2 * left)), 0), v: &v, idx: &idx)
-        }
     }
 
     /// Head-locked health hearts in the lower-left periphery. Each heart is a
@@ -8436,7 +8392,7 @@ final class WorldSession {
         // blue, regeneration) like vl_hudbars; plain red until one is known.
         let pair = client.healthIcon.flatMap { atlas.statusIconPairs[$0] }
         let full = pair?.full ?? atlas.healthFullLayer, half = pair?.half ?? atlas.healthHalfLayer
-        appendStatColumn(origin: origin, gaze: gaze, az: -0.20, value: min(hp, 20),   // low row, left of centre (HUD B)
+        appendStatColumn(origin: origin, gaze: gaze, az: -0.20 * hudS, value: min(hp, 20),   // low row, left of centre (HUD B)
                          full: full, half: half, empty: atlas.healthEmptyLayer, into: &billboards)
         // HP above 20 (health boost) stacks extra rows above, 20 HP each, the
         // way vl_hudbars layers its bar; without them losing health above 20
@@ -8445,14 +8401,14 @@ final class WorldSession {
         var rest = hp - 20
         while rest > 0 && rowElev < 0.2 {
             rowElev += 0.05   // a full icon apart, like vl_hudbars' first (unsquished) layers
-            appendStatColumn(origin: origin, gaze: gaze, az: -0.20, value: min(rest, 20),
+            appendStatColumn(origin: origin, gaze: gaze, az: -0.20 * hudS, value: min(rest, 20),
                              full: full, half: half, empty: -1, elevOffset: rowElev, into: &billboards)
             rest -= 20
         }
         // Absorption (golden apple): gold hearts in a row above the rest, only
         // as many as there are, like vl_hudbars' absorption part.
         if client.absorption > 0, let gold = atlas.statusIconPairs["mcl_potions_icon_absorb.png"] {
-            appendStatColumn(origin: origin, gaze: gaze, az: -0.20, value: client.absorption,
+            appendStatColumn(origin: origin, gaze: gaze, az: -0.20 * hudS, value: client.absorption,
                              full: gold.full, half: gold.half, empty: -1, elevOffset: rowElev + 0.045, into: &billboards)
         }
     }
@@ -8536,7 +8492,7 @@ final class WorldSession {
     private func appendHungerHUD(origin: SIMD3<Float>, gaze: SIMD3<Float>,
                                  into billboards: inout [EntityInstance]) {
         let pair = client.hungerIcon.flatMap { atlas.statusIconPairs[$0] }   // food poisoning swaps the icon
-        appendStatColumn(origin: origin, gaze: gaze, az: 0.20, value: hunger,   // low row, right of centre (HUD B)
+        appendStatColumn(origin: origin, gaze: gaze, az: 0.20 * hudS, value: hunger,   // low row, right of centre (HUD B)
                          full: pair?.full ?? atlas.hungerFullLayer, half: pair?.half ?? atlas.hungerHalfLayer,
                          empty: atlas.hungerEmptyLayer, into: &billboards)
     }
@@ -8551,7 +8507,7 @@ final class WorldSession {
         guard breath < 20 else { return }
         let hudDist: Float = 1.35 * hudK   // focal plane, was 1.7 (HUD P1); hudK = the HUD distance setting
         let size: Float = 0.05 * hudDist
-        let elev: Float = 0.30            // above the gaze (top of view)
+        let elev: Float = 0.30 * hudS     // above the gaze (top of view)
         let step: Float = 0.055
         let az0 = -Float(9) * step / 2    // centred row of 10
         let (fwd, right, up) = stableFrame(gaze, horizFwd: player.bodyForward())
@@ -8568,20 +8524,17 @@ final class WorldSession {
         }
     }
 
-    /// A vertical 10-icon column of a 0..20 stat, head-locked at a fixed azimuth
-    /// off the gaze (negative = left edge, positive = right edge). Icons stack
-    /// top-to-bottom; 2 points each with full/half/empty. Kept out of the centre
-    /// so the two bars don't overlap (they used to share one horizontal row).
+    /// A 10-icon row of a 0..20 stat, head-locked in the low band at a fixed
+    /// azimuth off the gaze (`az` is the row's centre: hearts left of centre,
+    /// hunger right). Icons run left to right, 2 points each with
+    /// full/half/empty. (The name is from when these were corner columns.)
     private func appendStatColumn(origin: SIMD3<Float>, gaze: SIMD3<Float>,
                                   az: Float, value: Int,
                                   full: Int32, half: Int32, empty: Int32, elevOffset: Float = 0,
                                   into billboards: inout [EntityInstance]) {
-        // HUD layout B: a single low HORIZONTAL row (hearts left, hunger right)
-        // in the comfortable lower band, instead of two tall corner columns that
-        // read as crowded. `az` is the row centre; 10 icons run across it.
         let hudDist: Float = 1.35 * hudK   // on the panel focal plane (HUD P1); hudK = the HUD distance setting
         let size: Float = 0.042 * hudDist
-        let elev: Float = -0.30 + elevOffset   // low band, below the gaze (HUD P3/B)
+        let elev: Float = -0.30 * hudS + elevOffset   // low band, below the gaze (HUD P3/B)
         // Icons overlap by 1/9 of their width like Minecraft's 9 px hearts on
         // an 8 px pitch; a 0.05 rad icon on a 0.032 step hid the half-heart edge.
         let hstep: Float = 0.042 * 8 / 9   // radians between icons, left to right
@@ -10123,13 +10076,10 @@ final class WorldSession {
     }
 
     /// A head-locked, camera-facing quad centred in the view, in origin space
-    /// (metres) so it rides the model stream like the crack overlay. gaze is the
-    /// world aim; rotate it into origin space by -yaw (cosY/sinY).
-    private func appendDeathText(layer: Int, gaze: SIMD3<Float>, cosY: Float, sinY: Float,
-                                 v: inout [Float], idx: inout [UInt32]) {
-        // Head-locked: place the overlay as head * (forward*dist), centred and
-        // upright in the view regardless of head pitch/roll (gaze/cosY/sinY
-        // unused now that we use the real head frame).
+    /// (metres) so it rides the model stream like the crack overlay.
+    private func appendDeathText(layer: Int, v: inout [Float], idx: inout [UInt32]) {
+        // Placed as head * (forward*dist), centred and upright in the view
+        // regardless of head pitch/roll.
         let hx = frameHeadXform
         let headPos = SIMD3<Float>(hx.columns.3.x, hx.columns.3.y, hx.columns.3.z)
         let right = simd_normalize(SIMD3<Float>(hx.columns.0.x, hx.columns.0.y, hx.columns.0.z))
@@ -10423,7 +10373,7 @@ final class WorldSession {
         let hf = -simd_normalize(SIMD3<Float>(hx.columns.2.x, hx.columns.2.y, hx.columns.2.z))
         // Well up in the UPPER visual field and pushed back so it doesn't sit over
         // the action (Eric: the "Bug note saved" banner was still too prominent).
-        let center = headPos + hf * 1.5 * hudK + hu * 0.30
+        let center = headPos + hf * 1.5 * hudK + hu * 0.30 * hudS
         // Backdrop is a short band; the text quad is SQUARE so the square text
         // canvas isn't squashed vertically (that made it a thin unreadable line).
         // The canvas margins are transparent, so only the centred text band shows.
@@ -10454,13 +10404,13 @@ final class WorldSession {
         // stacking downward. Text quads are square so the square text canvas isn't
         // squashed into a thin unreadable line (HUD P2).
         let ordered = active.reversed()   // newest first (top)
-        var oy: Float = 0.36              // top edge well up in the upper field so a long MOTD/chat sits above the action, not over it (Eric)
+        var oy: Float = 0.36 * hudS       // top edge well up in the upper field so a long MOTD/chat sits above the action, not over it (Eric)
         // An advancement arrives as a toast AND a chat line at the same moment,
         // and both live in the upper field: start the chat stack under the
         // toast's bottom edge while it shows (awardBox is last frame's, which is
         // fine for a 3 s toast). Converts the HUD pixel row to height on our plane.
         if let box = awardBox {
-            let el = (Self.hudScreen.y / 2 - box.hi.y) * (2 * Self.hudHalfAngle.y / Self.hudScreen.y)
+            let el = (hudScreen.y / 2 - box.hi.y) * (2 * hudHalfAngle.y / hudScreen.y)
             oy = min(oy, tan(el) * 1.7 - 0.02)
         }
         for slot in ordered {
