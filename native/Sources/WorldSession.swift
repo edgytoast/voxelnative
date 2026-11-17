@@ -6589,10 +6589,12 @@ final class WorldSession {
     }
     /// mcl_info's coordinate readout ("Location: Overworld: x:117.4 y:37.0
     /// z:93.7", plus a black shadow copy 1 px off) redrawn as three columns
-    /// top-left, the mirror of the status effects top-right: x, y, z labels
-    /// on the effects' level row, whole-number values on their time row.
+    /// top-right, under the minimap, with the status effects hanging below
+    /// them: x, y, z labels on one row, whole-number values on the next.
     /// The realm is dropped (you can see which one you're in) and so is the
     /// word Location. Values are floored: the block you stand in.
+    /// Our coordinate readout's element ids (labels, values, biome line).
+    static func isCoordinateId(_ id: Int) -> Bool { (2_100_000...2_100_013).contains(id) || id == 2_100_030 }
     static func coordinateColumns(_ els: [(Int, Client.HudElement)]) -> [(Int, Client.HudElement)] {
         // mcl_info's readout is one text element, one "Key: value" line per
         // field the debug level allows: at level 1 just "Location: ...", at 3
@@ -6617,20 +6619,24 @@ final class WorldSession {
             if let p = name.firstIndex(of: "(") { name = String(name[..<p]).trimmingCharacters(in: .whitespaces) }
             if let c = name.firstIndex(of: ",") { name = String(name[..<c]).trimmingCharacters(in: .whitespaces) }
             var el = Client.HudElement()
-            el.type = 1; el.text = name; el.pos = SIMD2(0, 0); el.align = SIMD2(1, 1)
-            el.offset = SIMD2(6, 82); el.number = 0xCCCAC0; el.zIndex = 100; el.style = 1
+            el.type = 1; el.text = name; el.pos = SIMD2(1, 0); el.align = SIMD2(-1, 1)
+            el.offset = SIMD2(-6, 54); el.number = 0xCCCAC0; el.zIndex = 100; el.style = 1
             out.append((2_100_030, el))
         }
         for (k, axis) in ["x", "y", "z"].enumerated() {
             guard let v = value(axis) else { continue }
-            // Column centres 52 px apart from the left edge, like the effect
-            // icons from the right (-54, -106, ...), text rows 50 and 65.
-            let cx: Float = 30 + 52 * Float(k)
+            // Column centres 52 px apart in from the right edge (z nearest the
+            // edge so x y z still read left to right), text rows 22 and 37
+            // (tight under the minimap: at 50 and 65 the gap read as a hole).
+            // Top right, under the minimap when it shows: top left put them
+            // out at the edge of the comfortable zone once the HUD spread
+            // grew, and the right side already has the minimap to sit under.
+            let cx: Float = -(30 + 52 * Float(2 - k))
             var label = Client.HudElement()
-            label.type = 1; label.text = axis; label.pos = SIMD2(0, 0); label.align = SIMD2(0, 1)
-            label.offset = SIMD2(cx, 50); label.number = 0xCCCAC0; label.zIndex = 100; label.style = 1
+            label.type = 1; label.text = axis; label.pos = SIMD2(1, 0); label.align = SIMD2(0, 1)
+            label.offset = SIMD2(cx, 22); label.number = 0xCCCAC0; label.zIndex = 100; label.style = 1
             var val = label
-            val.text = String(v); val.offset = SIMD2(cx, 65); val.number = 0xFFFFFF
+            val.text = String(v); val.offset = SIMD2(cx, 37); val.number = 0xFFFFFF
             out.append((2_100_000 + k, label)); out.append((2_100_010 + k, val))
         }
         return out
@@ -7042,6 +7048,7 @@ final class WorldSession {
             if e.type == 0, e.align.y > 0.5, !e.text.isEmpty { return (id, e.pos, e.offset, true) }
             return nil
         }
+        let hasCoords = elems.contains { Self.isCoordinateId($0.0) && !skip.contains($0.0) }
         for (id, e) in elems where !skip.contains(id) && drawn < 128 {
             // statbar/inventory/compass/minimap/hotbar aren't drawn here EXCEPT
             // the award-icon hack: VoxeLibre's advancement toast draws its icon as
@@ -7058,15 +7065,13 @@ final class WorldSession {
             // over its bar, a label over its timer) stays proportional; only the
             // normalised position stays pinned to the screen edge.
             var anchor = e.pos * hudScreen + e.offset * Self.hudSizeBoost
-            // The coordinate columns (our redraw of mcl_info's readout, ids
-            // 2_100_0xx) move out at half the HUD spread: at the full rate
-            // they were the first thing to leave the comfortable reading zone
-            // (Eric: at 1.15x the coordinates were too far out, the rest fine).
-            if (2_100_000...2_100_030).contains(id) { anchor.x += (hudS - 1) * Self.hudScreenBase.x * 0.25 }
-            // The minimap takes the top-right corner; potion icons and their
-            // timers (anchored there) hang below it instead. (Sliding them left
-            // put the timers on the boss bar's right end.)
-            if minimapDrawn, e.pos.x >= 0.99, e.pos.y <= 0.01 { anchor.y += 2 * Self.minimapRadiusPx + 30 }
+            // The minimap takes the top-right corner; the coordinate columns
+            // hang below it, and the potion icons and timers below those.
+            // (Sliding the effects left put the timers on the boss bar's end.)
+            if e.pos.x >= 0.99, e.pos.y <= 0.01 {
+                if minimapDrawn { anchor.y += 2 * Self.minimapRadiusPx + 30 }
+                if hasCoords, !Self.isCoordinateId(id) { anchor.y += 84 * Self.hudSizeBoost }   // the coordinate block: rows 22 to 54, the biome line, and a gap
+            }
             switch e.type {
             case 1:                                              // text
                 guard !e.text.isEmpty, let t = hudTextBlockLayer(id: id, text: e.text) else { continue }
@@ -7090,6 +7095,11 @@ final class WorldSession {
                 // lines fit like desktop while lone text keeps its full size.
                 var gap = Float.infinity
                 for o in textLines where o.id != id && o.pos == e.pos && abs(o.off.x - e.offset.x) < 40 {
+                    // The coordinate block and the potion rows share the top-right
+                    // anchor but the potions hang a block lower on screen, so
+                    // their offsets are not neighbours (the biome line sat 4 px
+                    // from an effect label in offset space and drew as a smudge).
+                    if Self.isCoordinateId(o.id) != Self.isCoordinateId(id) { continue }
                     // Under 3 px is the same line, not a neighbour: mcl_info draws
                     // a black copy 1 px off as a shadow, which squeezed the
                     // coordinate readout to a smudge.
