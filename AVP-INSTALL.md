@@ -52,3 +52,7 @@ To work in Xcode instead, run `xcodegen generate` in `native/`, open `VoxelNativ
 - **Controls:** you look around and aim with your head. With the Sense controllers, the left stick walks and the right stick turns; the right trigger digs and the right grip places or uses; Circle opens the inventory and Options the pause menu. With a keyboard, WASD walks, F digs, R places, I opens the inventory and Esc pauses. The full list is on the [controls page](https://bettse.github.io/voxelnative/controls.html).
 - The PS VR2 controllers give 6DoF tracking, buttons, sticks and haptics on visionOS; precision haptics and adaptive triggers don't come through.
 - The README notes that much of the code was written with an AI coding assistant, and that it is still a work in progress and rough in places. Bug reports and fixes are welcome on [GitHub](https://github.com/bettse/voxelnative/issues).
+
+## Support
+
+This fork keeps Luanti installable on Apple Vision Pro. It's maintained as part of the [AVP Ports Index](https://github.com/edgytoast/avp-ports-index), which tracks every port we can find and runs a safety check on each one. If this guide got you playing, you can [buy me a coffee](https://buymeacoffee.com/adminpz) to help keep it running.
